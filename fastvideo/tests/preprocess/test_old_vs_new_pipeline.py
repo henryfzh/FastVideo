@@ -41,7 +41,6 @@ I2V_CONFIG = {
 
 
 def compare_parquet_files(old_path: str, new_path: str, tolerance: float = 1e-5) -> bool:
-    # Compare two parquet files for equality
     logger.info("\nStarting parquet file comparison")
     
     old_path = Path(old_path)
@@ -77,6 +76,10 @@ def compare_parquet_files(old_path: str, new_path: str, tolerance: float = 1e-5)
         logger.error(f"Only in new: {new_cols - old_cols}")
         return False
     
+    # Track if any column fails - but keep checking all columns
+    all_passed = True
+    failed_columns = []
+    
     for col in sorted(old_df.columns):
         logger.info(f"Comparing column: {col}")
         
@@ -91,28 +94,48 @@ def compare_parquet_files(old_path: str, new_path: str, tolerance: float = 1e-5)
                     
                     if isinstance(old_val, np.ndarray):
                         if not np.allclose(old_val, new_val, rtol=tolerance, atol=tolerance):
-                            logger.error(f"Column {col}: values differ at row {idx}")
-                            return False
+                            logger.error(f"Column {col}: array values differ at row {idx}")
+                            all_passed = False
+                            failed_columns.append(col)
+                            break  # Stop checking this column's rows, move to next column
                     elif old_val != new_val:
                         logger.error(f"Column {col}: values differ at row {idx}")
-                        return False
+                        logger.error(f"  Old value: {old_val}")
+                        logger.error(f"  New value: {new_val}")
+                        all_passed = False
+                        failed_columns.append(col)
+                        break  # Stop checking this column's rows, move to next column
             elif np.issubdtype(old_values.dtype, np.number):
                 if not np.allclose(old_values, new_values, rtol=tolerance, atol=tolerance, equal_nan=True):
                     logger.error(f"Column {col}: numeric values differ")
                     logger.error(f"  All old values: {old_values.tolist()}")
                     logger.error(f"  All new values: {new_values.tolist()}")
-                    return False
+                    all_passed = False
+                    failed_columns.append(col)
             else:
                 if not old_values.equals(new_values):
                     logger.error(f"Column {col}: values differ")
-                    return False
+                    for idx in range(len(old_values)):
+                        if old_values.iloc[idx] != new_values.iloc[idx]:
+                            logger.error(f"  First difference at row {idx}")
+                            logger.error(f"    Old: {old_values.iloc[idx]}")
+                            logger.error(f"    New: {new_values.iloc[idx]}")
+                            break
+                    all_passed = False
+                    failed_columns.append(col)
                     
         except Exception as e:
             logger.error(f"Column {col}: comparison error - {e}")
-            return False
+            all_passed = False
+            failed_columns.append(col)
     
-    logger.info("All comparisons passed")
-    return True
+    # Summary at the end
+    if all_passed:
+        logger.info("All comparisons passed")
+    else:
+        logger.error(f"Comparison failed for {len(failed_columns)} columns: {failed_columns}")
+    
+    return all_passed
 
 
 def download_data(raw_data_dir: Path, hf_repo: str):
@@ -274,10 +297,10 @@ def compare_outputs(config: dict):
 def run_preprocessing_test(config: dict, test_name: str):
     print(f"Starting {test_name} Preprocessing Comparison Test")
     
-    # cleanup_outputs(config)
-    # download_data(config["raw_data_dir"], config["hf_repo"])
-    # run_old_preprocessing(config)
-    # run_new_preprocessing(config)
+    cleanup_outputs(config)
+    download_data(config["raw_data_dir"], config["hf_repo"])
+    run_old_preprocessing(config)
+    run_new_preprocessing(config)
     compare_outputs(config)
     
     print(f"{test_name} Preprocessing Comparison Test Completed")
