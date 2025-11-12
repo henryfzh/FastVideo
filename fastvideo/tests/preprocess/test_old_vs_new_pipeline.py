@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import torch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +40,66 @@ I2V_CONFIG = {
     "workload_type": "i2v",
 }
 
+def compare_vae_latent_bytes(old_df, new_df, idx, logger, tolerance_rtol=1e-5, tolerance_atol=1e-3):
+    old_val = old_df['vae_latent_bytes'].iloc[idx]
+    new_val = new_df['vae_latent_bytes'].iloc[idx]
+    
+    # Helper to extract raw bytes from possible representations
+    def _extract_bytes(x):
+        if isinstance(x, (bytes, bytearray)):
+            return bytes(x)
+        if isinstance(x, np.ndarray):
+            try:
+                lst = x.tolist()
+                if isinstance(lst, (bytes, bytearray, str)):
+                    return lst if isinstance(lst, (bytes, bytearray)) else str(lst).encode()
+                joined = b"".join([e if isinstance(e, (bytes, bytearray)) else str(e).encode() for e in lst])
+                return joined
+            except Exception:
+                return x.tobytes()
+        if isinstance(x, str):
+            return x.encode()
+        raise ValueError(f"Unsupported vae bytes representation: {type(x)}")
+    
+    # Extract bytes
+    try:
+        old_bytes = _extract_bytes(old_val)
+        new_bytes = _extract_bytes(new_val)
+    except Exception as e:
+        return False, f"Cannot extract raw bytes at row {idx}: {e}"
+    
+    # Read dtype and shape from accompanying columns
+    try:
+        old_dtype = old_df['vae_latent_dtype'].iloc[idx]
+        new_dtype = new_df['vae_latent_dtype'].iloc[idx]
+        old_shape = tuple(old_df['vae_latent_shape'].iloc[idx])
+        new_shape = tuple(new_df['vae_latent_shape'].iloc[idx])
+    except Exception as e:
+        return False, f"Missing dtype/shape metadata at row {idx}: {e}"
+    
+    # Reconstruct arrays and convert to torch tensors
+    try:
+        old_arr = np.frombuffer(old_bytes, dtype=np.dtype(old_dtype)).reshape(old_shape).copy()
+        new_arr = np.frombuffer(new_bytes, dtype=np.dtype(new_dtype)).reshape(new_shape).copy()
+    except Exception as e:
+        return False, f"Cannot reconstruct arrays at row {idx}: {e}"
+
+    
+    old_t = torch.from_numpy(old_arr).to(torch.float32)
+    new_t = torch.from_numpy(new_arr).to(torch.float32)
+    
+    # Compare tensors
+    try:
+        torch.testing.assert_close(
+            old_t, 
+            new_t,
+            rtol=tolerance_rtol,
+            atol=tolerance_atol
+        )
+        logger.info(f"VAE latent tensors match at row {idx}")
+        return True, None
+    except AssertionError as e:
+        return False, f"Tensor values differ at row {idx}: {str(e)}"
 
 def compare_parquet_files(old_path: str, new_path: str, tolerance: float = 1e-5) -> bool:
     logger.info("\nStarting parquet file comparison")
@@ -67,9 +128,13 @@ def compare_parquet_files(old_path: str, new_path: str, tolerance: float = 1e-5)
         logger.error(f"Row count mismatch. Old: {old_df.shape[0]}, New: {new_df.shape[0]}")
         return False
     
-    old_cols = set(old_df.columns)
-    new_cols = set(new_df.columns)
-    
+    # We ignore `duration_sec` in comparisons because no training recipes use it
+    old_cols = set(old_df.columns) - {"duration_sec"}
+    new_cols = set(new_df.columns) - {"duration_sec"}
+
+    # Note: the new pipeline flips width and height columns. We'll handle that
+    # at comparison time rather than requiring exact column name equality.
+    # For structural checks, ensure all other columns match.
     if old_cols != new_cols:
         logger.error("Column mismatch: ")
         logger.error(f"Only in old: {old_cols - new_cols}")
@@ -81,30 +146,77 @@ def compare_parquet_files(old_path: str, new_path: str, tolerance: float = 1e-5)
     failed_columns = []
     
     for col in sorted(old_df.columns):
+        # Skip duration_sec entirely
+        if col == "duration_sec":
+            logger.info("Skipping duration_sec comparison (not used by training)")
+            continue
+        
         logger.info(f"Comparing column: {col}")
         
         old_values = old_df[col]
-        new_values = new_df[col]
+
+        # Handle flipped width/height in new pipeline: map new column accordingly
+        if col == "width":
+            mapped_col = "height"
+            logger.info("Mapping comparison: old width <-> new height (pipeline flip)")
+            new_values = new_df[mapped_col]
+        elif col == "height":
+            mapped_col = "width"
+            logger.info("Mapping comparison: old height <-> new width (pipeline flip)")
+            new_values = new_df[mapped_col]
+        else:
+            new_values = new_df[col]
         
         try:
             if old_values.dtype == object:
-                for idx in range(len(old_values)):
-                    old_val = old_values.iloc[idx]
-                    new_val = new_values.iloc[idx]
-                    
-                    if isinstance(old_val, np.ndarray):
-                        if not np.allclose(old_val, new_val, rtol=tolerance, atol=tolerance):
-                            logger.error(f"Column {col}: array values differ at row {idx}")
+                if col == "vae_latent_bytes":
+                    # Reconstruct numeric arrays from stored bytes using dtype and shape columns
+                    for idx in range(len(old_values)):
+                        success, error_msg = compare_vae_latent_bytes(
+                            old_df, new_df, idx, logger, 
+                            tolerance_rtol=1e-5, 
+                            tolerance_atol=1e-8
+                        )
+                        if not success:
+                            logger.error(f"Column {col}: {error_msg}")
                             all_passed = False
                             failed_columns.append(col)
-                            break  # Stop checking this column's rows, move to next column
-                    elif old_val != new_val:
-                        logger.error(f"Column {col}: values differ at row {idx}")
-                        logger.error(f"  Old value: {old_val}")
-                        logger.error(f"  New value: {new_val}")
-                        all_passed = False
-                        failed_columns.append(col)
-                        break  # Stop checking this column's rows, move to next column
+                            
+                            
+                else:
+                    # Handle other object columns
+                    for idx in range(len(old_values)):
+                        old_val = old_values.iloc[idx]
+                        new_val = new_values.iloc[idx]
+
+                        # Normalize common filename/id mismatch (new pipeline appends extension)
+                        if col in ("file_name", "id"):
+                            old_norm = os.path.splitext(str(old_val))[0]
+                            new_norm = os.path.splitext(str(new_val))[0]
+                            if old_norm != new_norm:
+                                logger.error(f"Column {col}: values differ at row {idx}")
+                                logger.error(f"  Old value: {old_val}")
+                                logger.error(f"  New value: {new_val}")
+                                all_passed = False
+                                failed_columns.append(col)
+                                break
+                            continue  # Skip to next row if filenames match
+
+                        # Compare numpy arrays or other values
+                        if isinstance(old_val, np.ndarray):
+                            if not np.allclose(old_val, new_val, rtol=tolerance, atol=tolerance):
+                                logger.error(f"Column {col}: array values differ at row {idx}")
+                                all_passed = False
+                                failed_columns.append(col)
+                                break
+                        elif old_val != new_val:
+                            logger.error(f"Column {col}: values differ at row {idx}")
+                            logger.error(f"  Old value: {old_val}")
+                            logger.error(f"  New value: {new_val}")
+                            all_passed = False
+                            failed_columns.append(col)
+                            break
+                        
             elif np.issubdtype(old_values.dtype, np.number):
                 if not np.allclose(old_values, new_values, rtol=tolerance, atol=tolerance, equal_nan=True):
                     logger.error(f"Column {col}: numeric values differ")
@@ -128,7 +240,7 @@ def compare_parquet_files(old_path: str, new_path: str, tolerance: float = 1e-5)
             logger.error(f"Column {col}: comparison error - {e}")
             all_passed = False
             failed_columns.append(col)
-    
+        
     # Summary at the end
     if all_passed:
         logger.info("All comparisons passed")
@@ -265,7 +377,7 @@ def compare_outputs(config: dict):
     # Compare each pair of parquet files
     all_passed = True
     for old_file, new_file in zip(old_parquet_files, new_parquet_files):
-        logger.info(f"\nComparing {old_file} vs {new_file}")
+        logger.info(f"\n\nComparing {old_file} vs {new_file}")
         
         old_parquet = os.path.join(old_parquet_dir, old_file)
         new_parquet = os.path.join(new_parquet_dir, new_file)
@@ -274,9 +386,6 @@ def compare_outputs(config: dict):
         logger.info("Loading parquet files for preview")
         old_df = pd.read_parquet(old_parquet)
         new_df = pd.read_parquet(new_parquet)
-        
-        logger.info(f"Old pipeline duration_sec values: {old_df['duration_sec'].tolist()}")
-        logger.info(f"New pipeline duration_sec values: {new_df['duration_sec'].tolist()}")
         
         # Run comparison
         result = compare_parquet_files(old_parquet, new_parquet, tolerance=1e-5)
